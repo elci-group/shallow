@@ -1,0 +1,15 @@
+[package]
+name = "shallowgrave-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shallowgrave"
+path = "src/main.rs"
+
+[dependencies]
+shallowgrave-core = { path = "../shallowgrave-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
