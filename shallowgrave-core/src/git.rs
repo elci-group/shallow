@@ -25,5 +25,5 @@ pub fn source_info(dir: &Path) -> SourceInfo {
     let dirty = run_git(dir, &["status", "--porcelain"])
         .map(|s| !s.is_empty())
         .unwrap_or(false);
-    SourceInfo { repository, commit, dirty }
+    SourceInfo { repository, commit, dirty, source_tree_hash: None }
 }
