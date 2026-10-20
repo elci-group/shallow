@@ -2,9 +2,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 use shallowgrave_core::github::{self, GhRemote};
 use shallowgrave_core::{Archive, ArchiveRequest};
+
+mod tracking;
+use tracking::{
+    read_cargo_package, DaemonGuard, TrackEvent, TrackEventKind, TrackedProject, TrackingRegistry,
+};
 
 #[derive(Parser)]
 #[command(name = "shallowgrave", version, about = "Immutable historical archive of software releases and their executable artefacts")]
@@ -102,6 +106,54 @@ enum Command {
         #[arg(long)]
         execute: bool,
     },
+    /// Register and inspect Cargo projects watched by the daemon.
+    Track {
+        #[command(subcommand)]
+        action: TrackCommand,
+    },
+    /// Continuously archive changed builds from registered projects.
+    Daemon {
+        /// Scan once and exit; useful for timers, CI, and health checks.
+        #[arg(long)]
+        once: bool,
+        /// Seconds between scans in continuous mode.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+        /// Emit one JSON object per project and scan.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrackCommand {
+    /// Add a project, or update its tracking configuration.
+    Add {
+        #[arg(default_value = ".")]
+        source_dir: PathBuf,
+        /// Binary path, relative to SOURCE_DIR unless absolute. Defaults to target/<profile>/<app>.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// Override the Cargo package name used as the application name.
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value = "release")]
+        profile: String,
+        #[arg(long = "feature", value_name = "FEATURE")]
+        features: Vec<String>,
+    },
+    /// List tracked projects and their last daemon result.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop tracking a project. Archived releases are never deleted.
+    Remove {
+        #[arg(default_value = ".")]
+        source_dir: PathBuf,
+    },
 }
 
 fn default_archive_root() -> PathBuf {
@@ -119,23 +171,6 @@ fn split_release(release: &str) -> Result<(&str, &str)> {
     release
         .split_once('@')
         .ok_or_else(|| anyhow!("expected `app@version`, got `{release}`"))
-}
-
-#[derive(Deserialize)]
-struct CargoToml {
-    package: CargoPackage,
-}
-
-#[derive(Deserialize)]
-struct CargoPackage {
-    name: String,
-    version: String,
-}
-
-fn read_cargo_package(source_dir: &Path) -> Result<CargoPackage> {
-    let text = std::fs::read_to_string(source_dir.join("Cargo.toml"))
-        .with_context(|| format!("--auto needs a Cargo.toml under {}", source_dir.display()))?;
-    Ok(toml::from_str::<CargoToml>(&text)?.package)
 }
 
 fn host_target() -> Option<String> {
@@ -159,10 +194,31 @@ fn resolve_display_path(p: &Path) -> String {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf()).display().to_string()
 }
 
+fn tracking_path(root: &Path) -> PathBuf {
+    root.join("tracking.json")
+}
+
+fn print_track_event(event: &TrackEvent, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(event)?);
+        return Ok(());
+    }
+    let release = match (&event.application, &event.version) {
+        (Some(app), Some(version)) => format!("{app}@{version}"),
+        _ => event.source_dir.display().to_string(),
+    };
+    match event.kind {
+        TrackEventKind::Archived => println!("✓ {release}: {}", event.detail),
+        TrackEventKind::Unchanged => println!("= {release}: {}", event.detail),
+        TrackEventKind::Error => eprintln!("! {release}: {}", event.detail),
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.archive.unwrap_or_else(default_archive_root);
-    let archive = Archive::open(root)?;
+    let archive = Archive::open(root.clone())?;
 
     match cli.command {
         Command::Archive { binary, app, version, target, profile, features, source_dir, auto, json } => {
@@ -411,8 +467,67 @@ fn main() -> Result<()> {
                 println!("Dry run only — pass --execute to actually publish to {repo}.");
             }
         }
+        Command::Track { action } => {
+            let path = tracking_path(&root);
+            let mut registry = TrackingRegistry::load(&path)?;
+            match action {
+                TrackCommand::Add { source_dir, binary, app, target, profile, features } => {
+                    let project = TrackedProject::new(&source_dir, binary, app, target, profile, features)?;
+                    let display = project.source_dir.display().to_string();
+                    let added = registry.add(project);
+                    registry.save(&path)?;
+                    println!("✓ {} tracking {display}", if added { "started" } else { "updated" });
+                }
+                TrackCommand::List { json } => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&registry)?);
+                    } else if registry.projects.is_empty() {
+                        println!("No projects tracked.");
+                    } else {
+                        for project in registry.projects {
+                            let state = if let Some(error) = project.last_error {
+                                format!("error: {error}")
+                            } else if let Some(snapshot) = project.last_archived {
+                                format!("archived {}@{} sha256={}", snapshot.application, snapshot.version, snapshot.sha256)
+                            } else {
+                                "waiting for first daemon scan".to_string()
+                            };
+                            println!("{} — {state}", project.source_dir.display());
+                        }
+                    }
+                }
+                TrackCommand::Remove { source_dir } => {
+                    let source_dir = source_dir.canonicalize().with_context(|| {
+                        format!("tracked source directory does not exist: {}", source_dir.display())
+                    })?;
+                    if !registry.remove(&source_dir) {
+                        return Err(anyhow!("project is not tracked: {}", source_dir.display()));
+                    }
+                    registry.save(&path)?;
+                    println!("✓ stopped tracking {} (archive preserved)", source_dir.display());
+                }
+            }
+        }
+        Command::Daemon { once, interval, json } => {
+            let path = tracking_path(&root);
+            let _guard = DaemonGuard::acquire(root.join("daemon.pid"))?;
+            loop {
+                let mut registry = TrackingRegistry::load(&path)?;
+                let events = registry.scan(&archive);
+                registry.save(&path)?;
+                for event in &events {
+                    print_track_event(event, json)?;
+                }
+                if once {
+                    if events.iter().any(|event| event.kind == TrackEventKind::Error) {
+                        return Err(anyhow!("one or more tracked projects failed; see the daemon results above"));
+                    }
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval));
+            }
+        }
     }
 
     Ok(())
 }
-
